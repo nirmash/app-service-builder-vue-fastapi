@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict'
 import { execFile, spawn } from 'node:child_process'
 import { readdir, readFile } from 'node:fs/promises'
+import { createRequire } from 'node:module'
 import test from 'node:test'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { promisify, stripVTControlCharacters } from 'node:util'
+import { getSessionStatus, loginUrl, logoutUrl } from './web/src/auth.js'
 
 function startServer(t, command, args, options) {
   const child = spawn(command, args, { ...options, stdio: ['ignore', 'pipe', 'pipe'] })
@@ -34,6 +36,107 @@ function startServer(t, command, args, options) {
     child.stderr.on('data', receive)
   })
 }
+
+test('local development does not pretend to have a Builder session', async (t) => {
+  const fetchMock = t.mock.method(globalThis, 'fetch', () => {
+    throw new Error('Local development must not call Builder authentication')
+  })
+  for (const hostname of ['localhost', '127.0.0.1', '[::1]', '::1', 'app.localhost']) {
+    assert.equal(await getSessionStatus(hostname), 'local')
+  }
+  assert.equal(fetchMock.mock.callCount(), 0)
+})
+
+test('session checks use Builder identities and same-origin cookies without caching', async (t) => {
+  const responses = [[], [{ provider_name: 'aad', user_id: 'test-user' }]]
+  const fetchMock = t.mock.method(globalThis, 'fetch', async () => Response.json(responses.shift()))
+  const controller = new AbortController()
+
+  assert.equal(await getSessionStatus('app.example', controller.signal), 'signed-out')
+  assert.equal(await getSessionStatus('app.example', controller.signal), 'signed-in')
+  for (const call of fetchMock.mock.calls) {
+    assert.deepEqual(call.arguments, ['/.auth/me', {
+      signal: controller.signal,
+      credentials: 'same-origin',
+      cache: 'no-store',
+      redirect: 'error',
+      headers: { Accept: 'application/json' },
+    }])
+  }
+})
+
+test('unavailable or malformed authentication is an error, not signed-out status', async (t) => {
+  const responses = [
+    new Response(null, { status: 401 }),
+    new Response(null, { status: 503 }),
+    new Response('<html></html>', { headers: { 'content-type': 'text/html' } }),
+    Response.json({ clientPrincipal: null }),
+    Response.json([null]),
+    Response.json([[]]),
+    new Response('{', { headers: { 'content-type': 'application/json' } }),
+  ]
+  const responseCount = responses.length
+  t.mock.method(globalThis, 'fetch', async () => responses.shift())
+  for (let index = 0; index < responseCount; index++) {
+    await assert.rejects(getSessionStatus('app.example'))
+  }
+})
+
+test('authentication network and abort failures remain visible to the caller', async (t) => {
+  const failures = [
+    new Error('Network unavailable'),
+    new DOMException('Request aborted', 'AbortError'),
+  ]
+  const expectedFailures = [...failures]
+  t.mock.method(globalThis, 'fetch', async () => { throw failures.shift() })
+  for (const expected of expectedFailures) {
+    await assert.rejects(getSessionStatus('app.example'), (failure) => failure === expected)
+  }
+})
+
+test('account controls render the matching session action and return logout through login', async (t) => {
+  const webRequire = createRequire(new URL('./web/package.json', import.meta.url))
+  const { createServer } = await import(pathToFileURL(webRequire.resolve('vite')).href)
+  const { createSSRApp } = await import(pathToFileURL(webRequire.resolve('vue')).href)
+  const { renderToString } = await import(pathToFileURL(webRequire.resolve('vue/server-renderer')).href)
+  const server = await createServer({
+    root: fileURLToPath(new URL('./web/', import.meta.url)),
+    server: { middlewareMode: true, watch: null },
+    logLevel: 'silent',
+  })
+  t.after(() => server.close())
+  const { default: AccountControls } = await server.ssrLoadModule('/src/components/AccountControls.vue')
+  const render = (status, message) => renderToString(createSSRApp(AccountControls, {
+    state: { status, message },
+  }))
+
+  const signedOut = await render('signed-out', 'Not signed in.')
+  assert.match(signedOut, /Log in/)
+  assert.equal(signedOut.match(/<a\b[^>]*href="([^"]+)"/)?.[1], loginUrl)
+  assert.doesNotMatch(signedOut, /Log out/)
+
+  const signedIn = await render('signed-in', 'Signed in to this app.')
+  assert.match(signedIn, /Log out/)
+  assert.equal(signedIn.match(/<a\b[^>]*href="([^"]+)"/)?.[1], logoutUrl)
+  assert.doesNotMatch(signedIn, /Log in/)
+
+  for (const state of ['loading', 'local']) {
+    assert.doesNotMatch(await render(state, 'Authentication is unavailable.'), /<(a|button)\b/)
+  }
+  const failed = await render('error', 'Could not check sign-in.')
+  assert.match(failed, /Could not check sign-in\./)
+  assert.match(failed, /<button\b[^>]*type="button"[^>]*>\s*Retry sign-in check\s*<\/button>/)
+  assert.doesNotMatch(failed, /<a\b/)
+
+  const origin = 'https://app.example'
+  const logout = new URL(logoutUrl, origin)
+  assert.equal(logout.pathname, '/.auth/logout')
+  const login = new URL(logout.searchParams.get('post_logout_redirect_uri'), origin)
+  assert.equal(login.origin, origin)
+  assert.equal(login.pathname, '/.auth/login/aad')
+  assert.equal(login.searchParams.get('post_login_redirect_uri'), '/')
+  assert.equal(login.href, new URL(loginUrl, origin).href)
+})
 
 test('manifest keeps separate frontend and API roots and routes', async () => {
   const manifest = await readFile(new URL('./builder.yaml', import.meta.url), 'utf8')

@@ -210,9 +210,33 @@ static host to return `index.html`; unknown client routes then render a
 not-found page with HTTP status 200. The `/api` prefix must take precedence
 over that fallback. Verify both behaviors after deployment.
 
-The API routes are public and unauthenticated. Do not send credentials or
+The API code does not implement authentication; Builder's deployed-app
+authentication can protect the frontend and API together. Do not send credentials or
 private data to the echo endpoint. `/api/request` returns only host,
 user-agent, and forwarded-protocol headers, not authorization or cookie headers.
+
+## Sign-in and sign-out
+
+The landing page uses the
+[Builder deployed-app authentication contract](https://builder.appservice.azure.com/docs/guides/authentication/#add-sign-in-links),
+not an application-owned session. It checks `/.auth/me` without caching and
+shows **Log in** for an empty identity array or **Log out** for a signed-in
+identity. Failed or invalid responses show an explicit error and retry control;
+they are not treated as signed out.
+
+**Log in** opens `/.auth/login/aad`, matching this app's Microsoft Entra sign-in.
+**Log out** navigates to `/.auth/logout`, which clears the Builder app session,
+then returns through the same login endpoint. Both redirect targets are fixed
+local paths, and successful sign-in returns home. This does not sign out the
+user's wider Microsoft session: Entra SSO may sign them in again without asking
+for a password.
+
+Builder owns these endpoints; FastAPI and Vite do not emulate them. On localhost,
+the page explicitly reports local development and does not offer nonfunctional
+sign-in controls. On a host without Builder authentication, the status check
+reports an error. When Builder requires authentication, visitors must sign in
+before the Vue page is served; the app's buttons do not change that policy or
+provide an authorization boundary.
 
 ## Deployment contract
 

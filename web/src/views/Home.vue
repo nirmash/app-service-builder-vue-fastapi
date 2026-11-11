@@ -1,8 +1,14 @@
 <script setup>
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { RouterLink } from 'vue-router'
+import { getSessionStatus } from '../auth.js'
+import AccountControls from '../components/AccountControls.vue'
 
 const controller = new AbortController()
+const authState = ref({
+  status: 'loading',
+  message: 'Checking sign-in...',
+})
 const apiState = ref({
   status: 'loading',
   message: 'Contacting the FastAPI backend...',
@@ -13,6 +19,34 @@ const endpoints = [
   { href: '/api/version', label: 'API version', detail: 'GET /api/version' },
   { href: '/version.json', label: 'frontend version', detail: 'GET /version.json' },
 ]
+
+async function checkSession() {
+  authState.value = {
+    status: 'loading',
+    message: 'Checking sign-in...',
+  }
+
+  try {
+    const status = await getSessionStatus(window.location.hostname, controller.signal)
+    authState.value = {
+      status,
+      message: {
+        local: 'Local development: Builder sign-in is available only on the hosted app.',
+        'signed-in': 'Signed in to this app.',
+        'signed-out': 'Not signed in.',
+      }[status],
+    }
+  } catch (error) {
+    if (error.name !== 'AbortError') {
+      authState.value = {
+        status: 'error',
+        message: `Could not check sign-in: ${error.message}`,
+      }
+    }
+  }
+}
+
+onMounted(checkSession)
 
 onMounted(async () => {
   try {
@@ -40,6 +74,8 @@ onBeforeUnmount(() => controller.abort())
 
 <template>
   <main class="landing">
+    <AccountControls :state="authState" @retry="checkSession" />
+
     <header class="hero">
       <p class="eyebrow">App Service Builder / Vue + FastAPI</p>
       <h1>Vue and FastAPI are running</h1>
